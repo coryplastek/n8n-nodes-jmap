@@ -1,6 +1,6 @@
 {
 	"name": "@coryplastek/n8n-nodes-jmap",
-	"version": "0.3.0",
+	"version": "0.4.0",
 	"description": "n8n community node for JMAP email protocol (RFC 8620/8621) - Works with Apache James, Twake Mail, Fastmail, and other JMAP-compatible servers",
 	"keywords": [
 		"n8n-community-node-package",
@@ -13,15 +13,18 @@
 		"rfc8621"
 	],
 	"license": "MIT",
-	"homepage": "https://github.com/mmaudet/n8n-nodes-jmap",
+	"homepage": "https://github.com/coryplastek/n8n-nodes-jmap",
 	"author": {
-		"name": "Michel-Marie Maudet",
-		"email": "mmaudet@linagora.com",
-		"url": "https://github.com/mmaudet"
+		"name": "Cory Plastek",
+		"email": "cory@plastek.io",
+		"url": "https://github.com/coryplastek"
 	},
 	"repository": {
 		"type": "git",
-		"url": "https://github.com/mmaudet/n8n-nodes-jmap.git"
+		"url": "https://github.com/coryplastek/n8n-nodes-jmap.git"
+	},
+	"publishConfig": {
+		"registry": "https://npm.pkg.github.com"
 	},
 	"main": "index.js",
 	"scripts": {
@@ -30,6 +33,7 @@
 		"format": "prettier nodes credentials --write",
 		"lint": "eslint 'nodes/**/*.ts' 'credentials/**/*.ts'",
 		"lintfix": "eslint 'nodes/**/*.ts' 'credentials/**/*.ts' --fix",
+		"prepare": "npm run build",
 		"prepublishOnly": "npm run build && npm run lint -q"
 	},
 	"files": [
