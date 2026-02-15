@@ -13,6 +13,7 @@ import {
 	getMailboxes,
 	queryEmails,
 	getEmails,
+	clearSessionCache,
 } from './GenericFunctions';
 
 export class JmapTrigger implements INodeType {
@@ -151,6 +152,9 @@ export class JmapTrigger implements INodeType {
 	};
 
 	async poll(this: IPollFunctions): Promise<INodeExecutionData[][] | null> {
+		// Clear session cache at start of each poll cycle
+		clearSessionCache();
+
 		const webhookData = this.getWorkflowStaticData('node');
 		const event = this.getNodeParameter('event') as string;
 		const simple = this.getNodeParameter('simple') as boolean;
@@ -205,27 +209,14 @@ export class JmapTrigger implements INodeType {
 		];
 
 		if (!simple) {
-			properties = [
-				...properties,
-				'bodyValues',
-				'textBody',
-				'htmlBody',
-				'bodyStructure',
-			];
+			properties = [...properties, 'bodyValues', 'textBody', 'htmlBody', 'bodyStructure'];
 		}
 
 		if (options.includeAttachments) {
 			properties.push('attachments');
 		}
 
-		const emails = await getEmails.call(
-			this,
-			accountId,
-			ids,
-			properties,
-			!simple,
-			!simple,
-		);
+		const emails = await getEmails.call(this, accountId, ids, properties, !simple, !simple);
 
 		if (emails.length === 0) {
 			return null;

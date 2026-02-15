@@ -1,8 +1,4 @@
-import {
-	ICredentialTestRequest,
-	ICredentialType,
-	INodeProperties,
-} from 'n8n-workflow';
+import { ICredentialTestRequest, ICredentialType, INodeProperties } from 'n8n-workflow';
 
 /**
  * JMAP API Credentials for Basic Auth or Bearer Token authentication
@@ -18,9 +14,10 @@ export class JmapApi implements ICredentialType {
 			displayName: 'JMAP Server URL',
 			name: 'serverUrl',
 			type: 'string',
-			default: 'https://jmap.example.com/jmap',
-			placeholder: 'https://jmap.example.com/jmap',
-			description: 'The base URL of the JMAP server',
+			default: '',
+			placeholder: 'https://api.fastmail.com',
+			description:
+				'The JMAP server base URL. The node will automatically discover endpoints via /.well-known/jmap. For Fastmail, use https://api.fastmail.com',
 			required: true,
 		},
 		{
@@ -92,7 +89,7 @@ export class JmapApi implements ICredentialType {
 	test: ICredentialTestRequest = {
 		request: {
 			baseURL: '={{$credentials.serverUrl}}',
-			url: '/session',
+			url: '/.well-known/jmap',
 			method: 'GET',
 			headers: {
 				Accept: 'application/json',

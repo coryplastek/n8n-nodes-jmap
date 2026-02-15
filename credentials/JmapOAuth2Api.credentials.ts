@@ -59,8 +59,9 @@ export class JmapOAuth2Api implements ICredentialType {
 			type: 'string',
 			default: '',
 			required: true,
-			placeholder: 'https://jmap.example.com/jmap',
-			hint: 'The JMAP API endpoint URL',
+			placeholder: 'https://api.fastmail.com',
+			description:
+				'The JMAP server base URL. Endpoints will be discovered automatically via /.well-known/jmap',
 		},
 		// OAuth2 configuration - hidden fields
 		{

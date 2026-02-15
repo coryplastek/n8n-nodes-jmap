@@ -26,6 +26,7 @@ import {
 	getThreads,
 	getAttachments,
 	IAttachmentOptions,
+	clearSessionCache,
 } from './GenericFunctions';
 
 export class Jmap implements INodeType {
@@ -267,7 +268,18 @@ export class Jmap implements INodeType {
 				displayOptions: {
 					show: {
 						resource: ['email'],
-						operation: ['get', 'delete', 'markAsRead', 'markAsUnread', 'move', 'reply', 'addLabel', 'removeLabel', 'getLabels', 'getAttachments'],
+						operation: [
+							'get',
+							'delete',
+							'markAsRead',
+							'markAsUnread',
+							'move',
+							'reply',
+							'addLabel',
+							'removeLabel',
+							'getLabels',
+							'getAttachments',
+						],
 					},
 				},
 				default: '',
@@ -475,7 +487,8 @@ export class Jmap implements INodeType {
 						name: 'includeInline',
 						type: 'boolean',
 						default: false,
-						description: 'Whether to include inline images (embedded in the email body) in addition to regular attachments',
+						description:
+							'Whether to include inline images (embedded in the email body) in addition to regular attachments',
 					},
 					{
 						displayName: 'Filter by MIME Type',
@@ -483,7 +496,8 @@ export class Jmap implements INodeType {
 						type: 'string',
 						default: '',
 						placeholder: 'application/pdf, image/*',
-						description: 'Comma-separated list of MIME types to include. Supports wildcards (e.g., image/*). Leave empty to include all.',
+						description:
+							'Comma-separated list of MIME types to include. Supports wildcards (e.g., image/*). Leave empty to include all.',
 					},
 				],
 			},
@@ -652,6 +666,10 @@ export class Jmap implements INodeType {
 	};
 
 	async execute(this: IExecuteFunctions): Promise<INodeExecutionData[][]> {
+		// Clear session cache at start of each execution
+		// This ensures fresh endpoint discovery for each workflow run
+		clearSessionCache();
+
 		const items = this.getInputData();
 		const returnData: INodeExecutionData[] = [];
 		const resource = this.getNodeParameter('resource', 0) as string;
@@ -773,7 +791,10 @@ export class Jmap implements INodeType {
 
 					if (operation === 'getAttachments') {
 						const emailId = this.getNodeParameter('emailId', i) as string;
-						const attachmentOptions = this.getNodeParameter('attachmentOptions', i) as IAttachmentOptions;
+						const attachmentOptions = this.getNodeParameter(
+							'attachmentOptions',
+							i,
+						) as IAttachmentOptions;
 
 						const attachmentResults = await getAttachments.call(
 							this,
@@ -905,8 +926,8 @@ export class Jmap implements INodeType {
 						}
 
 						// Build reply
-						const replyTo = (originalEmail.replyTo as IDataObject[]) ||
-							(originalEmail.from as IDataObject[]);
+						const replyTo =
+							(originalEmail.replyTo as IDataObject[]) || (originalEmail.from as IDataObject[]);
 
 						const email: IDataObject = {
 							to: replyTo,

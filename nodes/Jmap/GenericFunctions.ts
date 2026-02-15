@@ -51,6 +51,28 @@ export const JMAP_CAPABILITIES = {
 };
 
 /**
+ * Cache for JMAP session to avoid repeated discovery calls.
+ * Cache is keyed by server URL + auth type to handle multiple credentials.
+ * Cache is cleared at the start of each n8n execution/poll cycle.
+ */
+let sessionCache: Map<string, IJmapSession> = new Map();
+
+/**
+ * Clear the session cache.
+ * Should be called at the start of each execution or poll cycle.
+ */
+export function clearSessionCache(): void {
+	sessionCache.clear();
+}
+
+/**
+ * Generate a cache key for the session based on server URL and auth type.
+ */
+function getSessionCacheKey(serverUrl: string, authType: string): string {
+	return `${serverUrl}::${authType}`;
+}
+
+/**
  * Get the authentication type from node parameters
  */
 function getAuthType(context: IExecuteFunctions | ILoadOptionsFunctions | IPollFunctions): string {
@@ -79,9 +101,187 @@ async function getServerUrl(
 }
 
 /**
- * Make an authenticated JMAP request
+ * Make an authenticated HTTP request to any URL.
+ * This is the low-level function that handles auth headers.
+ *
+ * @param context - The n8n execution context
+ * @param method - HTTP method (GET, POST, etc.)
+ * @param url - Full URL to request
+ * @param body - Optional request body
  */
-async function makeJmapRequest(
+async function makeAuthenticatedRequest(
+	context: IExecuteFunctions | ILoadOptionsFunctions | IPollFunctions,
+	method: IHttpRequestMethods,
+	url: string,
+	body?: IDataObject,
+): Promise<IDataObject> {
+	const authType = getAuthType(context);
+
+	const baseOptions: IHttpRequestOptions = {
+		method,
+		url,
+		headers: {
+			'Content-Type': 'application/json',
+			Accept: 'application/json',
+		},
+		body,
+		json: true,
+		returnFullResponse: false,
+	};
+
+	if (authType === 'jmapOAuth2Api') {
+		const response = await context.helpers.httpRequestWithAuthentication.call(
+			context,
+			'jmapOAuth2Api',
+			baseOptions,
+		);
+		return response as IDataObject;
+	} else {
+		// Handle Basic Auth or Bearer Token
+		const credentials = await context.getCredentials('jmapApi');
+		const authMethod = (credentials.authMethod as string) || 'basicAuth';
+
+		const headers: Record<string, string> = {
+			'Content-Type': 'application/json',
+			Accept: 'application/json',
+		};
+
+		if (authMethod === 'basicAuth') {
+			const authString = Buffer.from(
+				`${credentials.email as string}:${credentials.password as string}`,
+			).toString('base64');
+			headers.Authorization = `Basic ${authString}`;
+		} else if (authMethod === 'bearerToken') {
+			headers.Authorization = `Bearer ${credentials.accessToken as string}`;
+		}
+
+		const options: IHttpRequestOptions = {
+			...baseOptions,
+			headers,
+		};
+
+		const response = await context.helpers.httpRequest(options);
+		return response as IDataObject;
+	}
+}
+
+/**
+ * Get JMAP session from the server using proper RFC 8620 discovery.
+ *
+ * Discovery flow:
+ * 1. Check cache for existing session
+ * 2. Try /.well-known/jmap (follows redirects per RFC)
+ * 3. Fallback to /jmap/session (Fastmail pattern)
+ * 4. Fallback to /session (original pattern)
+ * 5. Cache successful session for subsequent calls
+ *
+ * @returns The JMAP session object containing apiUrl, accounts, etc.
+ * @throws NodeApiError if session discovery fails
+ */
+export async function getJmapSession(
+	this: IExecuteFunctions | ILoadOptionsFunctions | IPollFunctions,
+): Promise<IJmapSession> {
+	const authType = getAuthType(this);
+	const serverUrl = await getServerUrl(this);
+	const cacheKey = getSessionCacheKey(serverUrl, authType);
+
+	// Return cached session if available
+	const cached = sessionCache.get(cacheKey);
+	if (cached) {
+		return cached;
+	}
+
+	// Normalize base URL (remove trailing slash)
+	const baseUrl = serverUrl.replace(/\/$/, '');
+
+	// URLs to try for session discovery, in order of preference
+	const sessionUrls = [
+		`${baseUrl}/.well-known/jmap`, // RFC 8620 standard
+		`${baseUrl}/jmap/session`, // Fastmail pattern
+		`${baseUrl}/session`, // Simple pattern
+	];
+
+	let lastError: Error | null = null;
+
+	for (const sessionUrl of sessionUrls) {
+		try {
+			const response = await makeAuthenticatedRequest(this, 'GET', sessionUrl, undefined);
+
+			// Validate it's a proper JMAP session response
+			const session = response as unknown as IJmapSession;
+
+			if (session.apiUrl && session.accounts) {
+				// Valid session - cache and return
+				sessionCache.set(cacheKey, session);
+				return session;
+			}
+
+			// Response didn't look like a valid session, try next URL
+			lastError = new Error(
+				`Invalid session response from ${sessionUrl}: missing apiUrl or accounts`,
+			);
+		} catch (error) {
+			lastError = error as Error;
+			// Continue to next URL
+		}
+	}
+
+	// All URLs failed
+	const errorMessage = lastError ? lastError.message : 'Unknown error';
+	throw new NodeApiError(this.getNode(), { message: errorMessage } as JsonObject, {
+		message:
+			`Failed to discover JMAP session. Tried: ${sessionUrls.join(', ')}. ` +
+			`Please ensure your JMAP Server URL points to a JMAP-compliant server. ` +
+			`For Fastmail, use: https://api.fastmail.com`,
+	});
+}
+
+/**
+ * Make a JMAP API request using the apiUrl from the session.
+ *
+ * This is the main function for making JMAP method calls (Email/get, Mailbox/query, etc.)
+ * It automatically discovers the correct API endpoint via getJmapSession().
+ *
+ * @param methodCalls - Array of JMAP method calls
+ * @param using - Array of capability URNs to use
+ * @returns The JMAP response with methodResponses
+ */
+export async function jmapApiRequest(
+	this: IExecuteFunctions | ILoadOptionsFunctions | IPollFunctions,
+	methodCalls: [string, IDataObject, string][],
+	using: string[] = [JMAP_CAPABILITIES.CORE, JMAP_CAPABILITIES.MAIL],
+): Promise<IJmapResponse> {
+	// Get session to obtain the correct apiUrl
+	const session = await getJmapSession.call(this);
+
+	const body: IJmapRequest = {
+		using,
+		methodCalls,
+	};
+
+	try {
+		// POST to the session's apiUrl, NOT to the configured serverUrl
+		const response = await makeAuthenticatedRequest(
+			this,
+			'POST',
+			session.apiUrl, // <-- This is the key fix!
+			body as unknown as IDataObject,
+		);
+		return response as unknown as IJmapResponse;
+	} catch (error) {
+		throw new NodeApiError(this.getNode(), error as JsonObject, {
+			message: `JMAP API request failed. API URL: ${session.apiUrl}`,
+		});
+	}
+}
+
+/**
+ * @deprecated Use makeAuthenticatedRequest() or jmapApiRequest() instead.
+ * This function is kept for backwards compatibility but should not be used in new code.
+ * It builds URLs from serverUrl instead of using session.apiUrl.
+ */
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+async function _makeJmapRequest(
 	context: IExecuteFunctions | ILoadOptionsFunctions | IPollFunctions,
 	method: IHttpRequestMethods,
 	endpoint: string,
@@ -141,45 +341,6 @@ async function makeJmapRequest(
 }
 
 /**
- * Get JMAP session from the server
- */
-export async function getJmapSession(
-	this: IExecuteFunctions | ILoadOptionsFunctions | IPollFunctions,
-): Promise<IJmapSession> {
-	try {
-		const response = await makeJmapRequest(this, 'GET', '/session');
-		return response as unknown as IJmapSession;
-	} catch (error) {
-		throw new NodeApiError(this.getNode(), error as JsonObject, {
-			message: 'Failed to get JMAP session',
-		});
-	}
-}
-
-/**
- * Make a JMAP API request
- */
-export async function jmapApiRequest(
-	this: IExecuteFunctions | ILoadOptionsFunctions | IPollFunctions,
-	methodCalls: [string, IDataObject, string][],
-	using: string[] = [JMAP_CAPABILITIES.CORE, JMAP_CAPABILITIES.MAIL],
-): Promise<IJmapResponse> {
-	const body: IJmapRequest = {
-		using,
-		methodCalls,
-	};
-
-	try {
-		const response = await makeJmapRequest(this, 'POST', '', body as unknown as IDataObject);
-		return response as unknown as IJmapResponse;
-	} catch (error) {
-		throw new NodeApiError(this.getNode(), error as JsonObject, {
-			message: 'JMAP API request failed',
-		});
-	}
-}
-
-/**
  * Get the primary account ID for mail
  */
 export async function getPrimaryAccountId(
@@ -207,10 +368,7 @@ export async function getMailboxes(
 	this: IExecuteFunctions | ILoadOptionsFunctions | IPollFunctions,
 	accountId: string,
 ): Promise<IDataObject[]> {
-	const response = await jmapApiRequest.call(
-		this,
-		[['Mailbox/get', { accountId }, 'c1']],
-	);
+	const response = await jmapApiRequest.call(this, [['Mailbox/get', { accountId }, 'c1']]);
 
 	const methodResponse = response.methodResponses[0];
 	if (methodResponse[0] === 'Mailbox/get') {
@@ -255,16 +413,9 @@ export async function queryEmails(
 	limit: number = 50,
 	position: number = 0,
 ): Promise<{ ids: string[]; total: number }> {
-	const response = await jmapApiRequest.call(
-		this,
-		[
-			[
-				'Email/query',
-				{ accountId, filter, sort, limit, position },
-				'c1',
-			],
-		],
-	);
+	const response = await jmapApiRequest.call(this, [
+		['Email/query', { accountId, filter, sort, limit, position }, 'c1'],
+	]);
 
 	const methodResponse = response.methodResponses[0];
 	if (methodResponse[0] === 'Email/query') {
@@ -286,31 +437,45 @@ export async function getEmails(
 	accountId: string,
 	ids: string[],
 	properties: string[] = [
-		'id', 'blobId', 'threadId', 'mailboxIds', 'keywords', 'size',
-		'receivedAt', 'from', 'to', 'cc', 'bcc', 'replyTo', 'subject',
-		'sentAt', 'hasAttachment', 'preview', 'bodyStructure', 'bodyValues',
-		'textBody', 'htmlBody', 'attachments',
+		'id',
+		'blobId',
+		'threadId',
+		'mailboxIds',
+		'keywords',
+		'size',
+		'receivedAt',
+		'from',
+		'to',
+		'cc',
+		'bcc',
+		'replyTo',
+		'subject',
+		'sentAt',
+		'hasAttachment',
+		'preview',
+		'bodyStructure',
+		'bodyValues',
+		'textBody',
+		'htmlBody',
+		'attachments',
 	],
 	fetchTextBodyValues: boolean = true,
 	fetchHTMLBodyValues: boolean = true,
 ): Promise<IDataObject[]> {
-	const response = await jmapApiRequest.call(
-		this,
+	const response = await jmapApiRequest.call(this, [
 		[
-			[
-				'Email/get',
-				{
-					accountId,
-					ids,
-					properties,
-					fetchTextBodyValues,
-					fetchHTMLBodyValues,
-					maxBodyValueBytes: 1048576,
-				},
-				'c1',
-			],
+			'Email/get',
+			{
+				accountId,
+				ids,
+				properties,
+				fetchTextBodyValues,
+				fetchHTMLBodyValues,
+				maxBodyValueBytes: 1048576,
+			},
+			'c1',
 		],
-	);
+	]);
 
 	const methodResponse = response.methodResponses[0];
 	if (methodResponse[0] === 'Email/get') {
@@ -385,10 +550,9 @@ export async function createDraft(
 		keywords: { $draft: true },
 	};
 
-	const response = await jmapApiRequest.call(
-		this,
-		[['Email/set', { accountId, create: { draft: emailCreate } }, 'c1']],
-	);
+	const response = await jmapApiRequest.call(this, [
+		['Email/set', { accountId, create: { draft: emailCreate } }, 'c1'],
+	]);
 
 	const methodResponse = response.methodResponses[0];
 	if (methodResponse[0] === 'error') {
@@ -436,10 +600,9 @@ export async function updateEmailKeywords(
 	emailId: string,
 	keywords: IDataObject,
 ): Promise<IDataObject> {
-	const response = await jmapApiRequest.call(
-		this,
-		[['Email/set', { accountId, update: { [emailId]: { keywords } } }, 'c1']],
-	);
+	const response = await jmapApiRequest.call(this, [
+		['Email/set', { accountId, update: { [emailId]: { keywords } } }, 'c1'],
+	]);
 
 	const methodResponse = response.methodResponses[0];
 	if (methodResponse[0] === 'Email/set') {
@@ -458,19 +621,16 @@ export async function moveEmail(
 	emailId: string,
 	targetMailboxId: string,
 ): Promise<IDataObject> {
-	const response = await jmapApiRequest.call(
-		this,
+	const response = await jmapApiRequest.call(this, [
 		[
-			[
-				'Email/set',
-				{
-					accountId,
-					update: { [emailId]: { mailboxIds: { [targetMailboxId]: true } } },
-				},
-				'c1',
-			],
+			'Email/set',
+			{
+				accountId,
+				update: { [emailId]: { mailboxIds: { [targetMailboxId]: true } } },
+			},
+			'c1',
 		],
-	);
+	]);
 
 	const methodResponse = response.methodResponses[0];
 	if (methodResponse[0] === 'Email/set') {
@@ -489,19 +649,16 @@ export async function addLabel(
 	emailId: string,
 	mailboxId: string,
 ): Promise<IDataObject> {
-	const response = await jmapApiRequest.call(
-		this,
+	const response = await jmapApiRequest.call(this, [
 		[
-			[
-				'Email/set',
-				{
-					accountId,
-					update: { [emailId]: { [`mailboxIds/${mailboxId}`]: true } },
-				},
-				'c1',
-			],
+			'Email/set',
+			{
+				accountId,
+				update: { [emailId]: { [`mailboxIds/${mailboxId}`]: true } },
+			},
+			'c1',
 		],
-	);
+	]);
 
 	const methodResponse = response.methodResponses[0];
 	if (methodResponse[0] === 'Email/set') {
@@ -520,19 +677,16 @@ export async function removeLabel(
 	emailId: string,
 	mailboxId: string,
 ): Promise<IDataObject> {
-	const response = await jmapApiRequest.call(
-		this,
+	const response = await jmapApiRequest.call(this, [
 		[
-			[
-				'Email/set',
-				{
-					accountId,
-					update: { [emailId]: { [`mailboxIds/${mailboxId}`]: null } },
-				},
-				'c1',
-			],
+			'Email/set',
+			{
+				accountId,
+				update: { [emailId]: { [`mailboxIds/${mailboxId}`]: null } },
+			},
+			'c1',
 		],
-	);
+	]);
 
 	const methodResponse = response.methodResponses[0];
 	if (methodResponse[0] === 'Email/set') {
@@ -592,10 +746,9 @@ export async function deleteEmails(
 	accountId: string,
 	emailIds: string[],
 ): Promise<IDataObject> {
-	const response = await jmapApiRequest.call(
-		this,
-		[['Email/set', { accountId, destroy: emailIds }, 'c1']],
-	);
+	const response = await jmapApiRequest.call(this, [
+		['Email/set', { accountId, destroy: emailIds }, 'c1'],
+	]);
 
 	const methodResponse = response.methodResponses[0];
 	if (methodResponse[0] === 'Email/set') {
@@ -613,10 +766,7 @@ export async function getThreads(
 	accountId: string,
 	ids: string[],
 ): Promise<IDataObject[]> {
-	const response = await jmapApiRequest.call(
-		this,
-		[['Thread/get', { accountId, ids }, 'c1']],
-	);
+	const response = await jmapApiRequest.call(this, [['Thread/get', { accountId, ids }, 'c1']]);
 
 	const methodResponse = response.methodResponses[0];
 	if (methodResponse[0] === 'Thread/get') {
@@ -646,15 +796,11 @@ export async function downloadBlob(
 		.replace('{type}', encodeURIComponent(type));
 
 	if (authType === 'jmapOAuth2Api') {
-		const response = await this.helpers.httpRequestWithAuthentication.call(
-			this,
-			'jmapOAuth2Api',
-			{
-				method: 'GET',
-				url: downloadUrl,
-				encoding: 'arraybuffer',
-			} as IHttpRequestOptions,
-		);
+		const response = await this.helpers.httpRequestWithAuthentication.call(this, 'jmapOAuth2Api', {
+			method: 'GET',
+			url: downloadUrl,
+			encoding: 'arraybuffer',
+		} as IHttpRequestOptions);
 		return Buffer.from(response as ArrayBuffer);
 	} else {
 		const credentials = await this.getCredentials('jmapApi');
@@ -733,11 +879,7 @@ export async function getAttachments(
 	const { includeInline = false, mimeTypeFilter = '' } = options;
 
 	// Get email with attachments metadata
-	const emails = await getEmails.call(this, accountId, [emailId], [
-		'id',
-		'subject',
-		'attachments',
-	]);
+	const emails = await getEmails.call(this, accountId, [emailId], ['id', 'subject', 'attachments']);
 
 	if (emails.length === 0) {
 		throw new Error(`Email with ID ${emailId} not found`);
@@ -752,7 +894,10 @@ export async function getAttachments(
 
 	// Parse MIME type filters
 	const mimeFilters = mimeTypeFilter
-		? mimeTypeFilter.split(',').map((f) => f.trim()).filter((f) => f)
+		? mimeTypeFilter
+				.split(',')
+				.map((f) => f.trim())
+				.filter((f) => f)
 		: [];
 
 	const results: INodeExecutionData[] = [];
@@ -763,7 +908,8 @@ export async function getAttachments(
 		// An attachment is considered inline if:
 		// - isInline is explicitly true, OR
 		// - it has a cid (Content-ID) which is used for inline images in HTML
-		const isInlineAttachment = attachment.isInline === true || (attachment.cid !== undefined && attachment.cid !== null);
+		const isInlineAttachment =
+			attachment.isInline === true || (attachment.cid !== undefined && attachment.cid !== null);
 		if (isInlineAttachment && !includeInline) {
 			continue;
 		}
